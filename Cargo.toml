@@ -1,0 +1,18 @@
+[package]
+name = "termwatch"
+version = "0.1.0"
+edition = "2021"
+authors = ["leadg"]
+description = "A high-performance, real-time Linux system & network activity monitor in Rust"
+readme = "README.md"
+license = "MIT"
+
+[dependencies]
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

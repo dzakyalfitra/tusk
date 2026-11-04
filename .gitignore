@@ -1,0 +1,12 @@
+# Rust / Cargo build outputs
+/target/
+
+# Cargo lockfile (often tracked for executables, but keep optional)
+# Cargo.lock
+
+# IDE & OS files
+.vscode/
+.idea/
+*.swp
+*.exe
+*.pdb

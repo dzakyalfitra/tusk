@@ -1,4 +1,4 @@
-//! 📊 TERMWATCH: HIGH-PERFORMANCE SYSTEM & NETWORK MONITOR 🦀
+//! 🦣 TUSK: RAZOR-SHARP LINUX SYSTEM & NETWORK MONITOR 🦀
 //!
 //! A real-time, low-overhead Linux system activity monitor written in Rust.
 //! Features:
@@ -395,7 +395,7 @@ fn render_dashboard(
     };
 
     out.push_str(&format!(
-        " \x1b[1;36mTERMWATCH\x1b[0m 🦀  {} | Uptime: \x1b[1m{}\x1b[0m | Load: \x1b[1m{:.2} {:.2} {:.2}\x1b[0m | Rate: {}ms\n",
+        " \x1b[1;36mTUSK\x1b[0m 🦣  {} | Uptime: \x1b[1m{}\x1b[0m | Load: \x1b[1m{:.2} {:.2} {:.2}\x1b[0m | Rate: {}ms\n",
         status_tag, uptime_str, l1, l5, l15, monitor.refresh_rate_ms
     ));
     out.push_str("\x1b[90m─────────────────────────────────────────────────────────────────────────────────\x1b[0m\n");

@@ -1,9 +1,9 @@
 [package]
-name = "termwatch"
+name = "tusk"
 version = "0.1.0"
 edition = "2021"
 authors = ["leadg"]
-description = "A high-performance, real-time Linux system & network activity monitor in Rust"
+description = "🦣 Tusk: A razor-sharp, lightweight Linux system & network monitor in Rust"
 readme = "README.md"
 license = "MIT"
 

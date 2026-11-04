@@ -11,9 +11,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::fs;
-use std::io::{self, Read, Write};
-
-use std::thread;
+use std::io::{self, Write};
 use std::time::{Duration, Instant};
 
 // =========================================================================
@@ -43,8 +41,16 @@ impl RawTerminalGuard {
                 return Err(io::Error::last_os_error());
             }
 
-            // Switch to Alternate Screen buffer and hide cursor
-            print!("\x1b[?1049h\x1b[?25l");
+            // Install panic hook to restore terminal on panic
+            let default_panic = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                println!("\x1b[?1049l\x1b[?25h\x1b[0m");
+                let _ = io::stdout().flush();
+                default_panic(info);
+            }));
+
+            // Switch to Alternate Screen buffer, clear screen, and hide cursor
+            print!("\x1b[?1049h\x1b[2J\x1b[?25l");
             io::stdout().flush()?;
 
             Ok(Self { original_termios })
@@ -58,9 +64,198 @@ impl Drop for RawTerminalGuard {
             // Restore original terminal attributes
             libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.original_termios);
             // Return from Alternate Screen buffer and show cursor
-            print!("\x1b[?1049l\x1b[?25h\x1b[0m\n");
+            println!("\x1b[?1049l\x1b[?25h\x1b[0m");
             let _ = io::stdout().flush();
         }
+    }
+}
+
+fn get_terminal_size() -> (usize, usize) {
+    unsafe {
+        let mut ws: libc::winsize = std::mem::zeroed();
+        if libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) == 0 {
+            let cols = if ws.ws_col > 0 {
+                ws.ws_col as usize
+            } else {
+                80
+            };
+            let rows = if ws.ws_row > 0 {
+                ws.ws_row as usize
+            } else {
+                24
+            };
+            (cols, rows)
+        } else {
+            (80, 24)
+        }
+    }
+}
+
+fn poll_stdin(timeout_ms: i32) -> bool {
+    let mut pfd = libc::pollfd {
+        fd: libc::STDIN_FILENO,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let res = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+    res > 0 && (pfd.revents & libc::POLLIN) != 0
+}
+
+fn read_stdin_bytes(buf: &mut [u8]) -> usize {
+    let res = unsafe {
+        libc::read(
+            libc::STDIN_FILENO,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            buf.len(),
+        )
+    };
+    if res > 0 {
+        res as usize
+    } else {
+        0
+    }
+}
+
+#[derive(Debug, PartialEq, Clone, Copy)]
+enum KeyAction {
+    Quit,
+    TogglePause,
+    Sort(SortOrder),
+    AdjustRate(i64),
+    Up,
+    Down,
+    PageUp,
+    PageDown,
+    Home,
+    End,
+}
+
+fn parse_keys(bytes: &[u8]) -> Vec<KeyAction> {
+    let mut actions = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'q' | b'Q' => {
+                actions.push(KeyAction::Quit);
+                i += 1;
+            }
+            27 => {
+                // Escape sequence (Arrow keys, PageUp/Down, Home, End, etc.)
+                if i + 1 < bytes.len() && (bytes[i + 1] == b'[' || bytes[i + 1] == b'O') {
+                    if i + 2 < bytes.len() {
+                        match bytes[i + 2] {
+                            b'A' => {
+                                actions.push(KeyAction::Up);
+                                i += 3;
+                            }
+                            b'B' => {
+                                actions.push(KeyAction::Down);
+                                i += 3;
+                            }
+                            b'C' => {
+                                i += 3;
+                            } // Right arrow
+                            b'D' => {
+                                i += 3;
+                            } // Left arrow
+                            b'H' => {
+                                actions.push(KeyAction::Home);
+                                i += 3;
+                            }
+                            b'F' => {
+                                actions.push(KeyAction::End);
+                                i += 3;
+                            }
+                            b'1'..=b'9' if i + 3 < bytes.len() && bytes[i + 3] == b'~' => {
+                                match bytes[i + 2] {
+                                    b'1' | b'7' => actions.push(KeyAction::Home),
+                                    b'4' | b'8' => actions.push(KeyAction::End),
+                                    b'5' => actions.push(KeyAction::PageUp),
+                                    b'6' => actions.push(KeyAction::PageDown),
+                                    _ => {}
+                                }
+                                i += 4;
+                            }
+                            _ => {
+                                // Skip unfamiliar CSI parameter bytes
+                                i += 2;
+                                while i < bytes.len() && (bytes[i] < 0x40 || bytes[i] > 0x7E) {
+                                    i += 1;
+                                }
+                                if i < bytes.len() {
+                                    i += 1;
+                                }
+                            }
+                        }
+                    } else {
+                        i = bytes.len();
+                    }
+                } else {
+                    // Lone ESC press -> Quit
+                    actions.push(KeyAction::Quit);
+                    i += 1;
+                }
+            }
+            b'k' | b'K' => {
+                actions.push(KeyAction::Up);
+                i += 1;
+            }
+            b'j' | b'J' => {
+                actions.push(KeyAction::Down);
+                i += 1;
+            }
+            b'g' => {
+                actions.push(KeyAction::Home);
+                i += 1;
+            }
+            b'G' => {
+                actions.push(KeyAction::End);
+                i += 1;
+            }
+            b' ' => {
+                actions.push(KeyAction::TogglePause);
+                i += 1;
+            }
+            b'c' | b'C' => {
+                actions.push(KeyAction::Sort(SortOrder::Cpu));
+                i += 1;
+            }
+            b'm' | b'M' => {
+                actions.push(KeyAction::Sort(SortOrder::Memory));
+                i += 1;
+            }
+            b'p' | b'P' => {
+                actions.push(KeyAction::Sort(SortOrder::Pid));
+                i += 1;
+            }
+            b'+' | b'=' => {
+                actions.push(KeyAction::AdjustRate(-250));
+                i += 1;
+            }
+            b'-' | b'_' => {
+                actions.push(KeyAction::AdjustRate(250));
+                i += 1;
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+    actions
+}
+
+fn format_time_ticks(ticks: u64) -> String {
+    let total_secs = ticks / 100;
+    let centis = ticks % 100;
+    let secs = total_secs % 60;
+    let total_mins = total_secs / 60;
+    let mins = total_mins % 60;
+    let hours = total_mins / 60;
+
+    if hours > 0 {
+        format!("{:>2}h{:02}m", hours, mins)
+    } else {
+        format!("{:>2}:{:02}.{:02}", mins, secs, centis)
     }
 }
 
@@ -131,10 +326,10 @@ struct ProcessInfo {
     state: char,
     rss_kb: u64,
     cpu_percent: f64,
-    _total_time_ticks: u64,
+    total_time_ticks: u64,
 }
 
-#[derive(PartialEq, Clone, Copy)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 enum SortOrder {
     Cpu,
     Memory,
@@ -155,6 +350,8 @@ struct SystemMonitor {
     sort_order: SortOrder,
     refresh_rate_ms: u64,
     paused: bool,
+    selected_index: usize,
+    scroll_offset: usize,
 }
 
 impl SystemMonitor {
@@ -169,6 +366,8 @@ impl SystemMonitor {
             sort_order: SortOrder::Cpu,
             refresh_rate_ms: 1000,
             paused: false,
+            selected_index: 0,
+            scroll_offset: 0,
         };
 
         // Seed initial CPU snapshots
@@ -181,6 +380,18 @@ impl SystemMonitor {
         }
 
         monitor
+    }
+
+    fn sort_processes(&self, procs: &mut [ProcessInfo]) {
+        match self.sort_order {
+            SortOrder::Cpu => procs.sort_by(|a, b| {
+                b.cpu_percent
+                    .partial_cmp(&a.cpu_percent)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            }),
+            SortOrder::Memory => procs.sort_by_key(|a| std::cmp::Reverse(a.rss_kb)),
+            SortOrder::Pid => procs.sort_by_key(|a| a.pid),
+        }
     }
 
     fn read_cpu_snapshots(&self) -> io::Result<(CpuRawSnapshot, Vec<CpuRawSnapshot>)> {
@@ -206,7 +417,10 @@ impl SystemMonitor {
         for line in content.lines() {
             let mut parts = line.split_whitespace();
             let key = parts.next().unwrap_or("");
-            let val = parts.next().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+            let val = parts
+                .next()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0);
 
             match key {
                 "MemTotal:" => mem.total_kb = val,
@@ -272,7 +486,8 @@ impl SystemMonitor {
             for entry in entries.flatten() {
                 if let Ok(name) = entry.file_name().into_string() {
                     if let Ok(pid) = name.parse::<u32>() {
-                        if let Ok(p_info) = self.parse_single_proc(pid, page_size_kb, elapsed_secs) {
+                        if let Ok(p_info) = self.parse_single_proc(pid, page_size_kb, elapsed_secs)
+                        {
                             procs.push(p_info);
                         }
                     }
@@ -281,22 +496,23 @@ impl SystemMonitor {
         }
 
         // Sort processes
-        match self.sort_order {
-            SortOrder::Cpu => procs.sort_by(|a, b| b.cpu_percent.partial_cmp(&a.cpu_percent).unwrap_or(std::cmp::Ordering::Equal)),
-            SortOrder::Memory => procs.sort_by(|a, b| b.rss_kb.cmp(&a.rss_kb)),
-            SortOrder::Pid => procs.sort_by(|a, b| a.pid.cmp(&b.pid)),
-        }
+        self.sort_processes(&mut procs);
 
         procs
     }
 
-    fn parse_single_proc(&mut self, pid: u32, page_size_kb: u64, elapsed_secs: f64) -> io::Result<ProcessInfo> {
+    fn parse_single_proc(
+        &mut self,
+        pid: u32,
+        page_size_kb: u64,
+        elapsed_secs: f64,
+    ) -> io::Result<ProcessInfo> {
         let stat_path = format!("/proc/{}/stat", pid);
         let stat_content = fs::read_to_string(stat_path)?;
 
         let start_paren = stat_content.find('(').ok_or(io::ErrorKind::InvalidData)?;
         let end_paren = stat_content.rfind(')').ok_or(io::ErrorKind::InvalidData)?;
-        let comm = stat_content[start_paren + 1..end_paren].to_string();
+        let short_comm = stat_content[start_paren + 1..end_paren].to_string();
 
         let after_paren = &stat_content[end_paren + 2..];
         let fields: Vec<&str> = after_paren.split_whitespace().collect();
@@ -318,7 +534,10 @@ impl SystemMonitor {
         let rss_kb = rss_pages * page_size_kb;
 
         // Calculate CPU %
-        let prev_ticks = self.prev_proc_times.insert(pid, total_ticks).unwrap_or(total_ticks);
+        let prev_ticks = self
+            .prev_proc_times
+            .insert(pid, total_ticks)
+            .unwrap_or(total_ticks);
         let tick_diff = total_ticks.saturating_sub(prev_ticks);
         let cpu_percent = if elapsed_secs > 0.0 {
             ((tick_diff as f64 / 100.0) / elapsed_secs) * 100.0
@@ -326,19 +545,43 @@ impl SystemMonitor {
             0.0
         };
 
+        // Try reading cmdline for full command line arguments, fall back to [short_comm]
+        let comm = fs::read(format!("/proc/{}/cmdline", pid))
+            .ok()
+            .and_then(|bytes| {
+                if bytes.is_empty() {
+                    None
+                } else {
+                    let s: String = bytes
+                        .iter()
+                        .map(|&b| if b == 0 { ' ' } else { b as char })
+                        .collect();
+                    let trimmed = s.trim().to_string();
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed)
+                    }
+                }
+            })
+            .unwrap_or_else(|| format!("[{}]", short_comm));
+
         Ok(ProcessInfo {
             pid,
             comm,
             state,
             rss_kb,
             cpu_percent,
-            _total_time_ticks: total_ticks,
+            total_time_ticks: total_ticks,
         })
     }
 }
 
 fn parse_cpu_line(line: &str) -> CpuRawSnapshot {
-    let mut nums = line.split_whitespace().skip(1).filter_map(|s| s.parse::<u64>().ok());
+    let mut nums = line
+        .split_whitespace()
+        .skip(1)
+        .filter_map(|s| s.parse::<u64>().ok());
     CpuRawSnapshot {
         user: nums.next().unwrap_or(0),
         nice: nums.next().unwrap_or(0),
@@ -365,15 +608,19 @@ fn calc_cpu_percent(prev: &CpuRawSnapshot, curr: &CpuRawSnapshot) -> f64 {
 // SECTION 4: TERMINAL UI RENDERING
 // =========================================================================
 
+#[allow(clippy::too_many_arguments)]
 fn render_dashboard(
     monitor: &mut SystemMonitor,
+    cols: usize,
+    rows: usize,
     global_cpu_pct: f64,
     core_cpu_pcts: &[f64],
     mem: &MemInfo,
     net_speeds: &HashMap<String, (f64, f64, u64, u64)>,
     processes: &[ProcessInfo],
 ) {
-    let mut out = String::with_capacity(8192);
+    let mut out = String::with_capacity(16384);
+    let mut rendered_lines = 0;
 
     // Reposition cursor to top-left
     out.push_str("\x1b[H");
@@ -394,121 +641,234 @@ fn render_dashboard(
         "\x1b[1;32m[LIVE]\x1b[0m"
     };
 
-    out.push_str(&format!(
-        " \x1b[1;36mTUSK\x1b[0m 🦣  {} | Uptime: \x1b[1m{}\x1b[0m | Load: \x1b[1m{:.2} {:.2} {:.2}\x1b[0m | Rate: {}ms\n",
-        status_tag, uptime_str, l1, l5, l15, monitor.refresh_rate_ms
-    ));
-    out.push_str("\x1b[90m─────────────────────────────────────────────────────────────────────────────────\x1b[0m\n");
+    let running_count = processes.iter().filter(|p| p.state == 'R').count();
+    let header = format!(
+        " \x1b[1;36mTUSK\x1b[0m 🦣  {} | Tasks: \x1b[1m{}\x1b[0m ({} running) | Uptime: \x1b[1m{}\x1b[0m | Load: \x1b[1m{:.2} {:.2} {:.2}\x1b[0m | Rate: {}ms\x1b[K\n",
+        status_tag, processes.len(), running_count, uptime_str, l1, l5, l15, monitor.refresh_rate_ms
+    );
+    out.push_str(&header);
+    rendered_lines += 1;
+
+    let div_len = cols.clamp(40, 1000);
+    let div = format!("\x1b[90m{}\x1b[0m\x1b[K\n", "─".repeat(div_len));
+
+    out.push_str(&div);
+    rendered_lines += 1;
 
     // 2. CPU Gauges & Historical Sparkline
     let sparkline = render_sparkline(&monitor.cpu_history);
     out.push_str(&format!(
-        " \x1b[1mCPU Total:\x1b[0m {:5.1}% {}  History: {}\n",
+        " \x1b[1mCPU Total:\x1b[0m {:5.1}% {}  History: {}\x1b[K\n",
         global_cpu_pct,
         render_colored_bar(global_cpu_pct, 24),
         sparkline
     ));
+    rendered_lines += 1;
 
-    // Per-core mini meters (2 per line)
-    for chunk in core_cpu_pcts.chunks(2) {
-        out.push_str("   ");
-        for (idx, &core_pct) in chunk.iter().enumerate() {
-            let core_num = core_cpu_pcts.iter().position(|&p| p == core_pct).unwrap_or(idx);
+    // Per-core mini meters (adaptive columns: 4 columns if wide and >8 cores, else 2)
+    let cores_per_row = if cols >= 120 && core_cpu_pcts.len() > 8 {
+        4
+    } else {
+        2
+    };
+    let bar_len = if cores_per_row == 4 { 10 } else { 12 };
+
+    for (chunk_idx, chunk) in core_cpu_pcts.chunks(cores_per_row).enumerate() {
+        out.push(' ');
+        for (sub_idx, &core_pct) in chunk.iter().enumerate() {
+            let core_num = chunk_idx * cores_per_row + sub_idx;
             out.push_str(&format!(
                 "Core {:02}: {:4.1}% {}   ",
                 core_num,
                 core_pct,
-                render_colored_bar(core_pct, 12)
+                render_colored_bar(core_pct, bar_len)
             ));
         }
-        out.push('\n');
+        out.push_str("\x1b[K\n");
+        rendered_lines += 1;
     }
 
-    out.push_str("\x1b[90m─────────────────────────────────────────────────────────────────────────────────\x1b[0m\n");
+    out.push_str(&div);
+    rendered_lines += 1;
 
     // 3. Memory & Swap Gauges
     let used_gb = mem.used_kb() as f64 / 1_048_576.0;
     let total_gb = mem.total_kb as f64 / 1_048_576.0;
-    let ram_pct = if total_gb > 0.0 { (used_gb / total_gb) * 100.0 } else { 0.0 };
+    let ram_pct = if total_gb > 0.0 {
+        (used_gb / total_gb) * 100.0
+    } else {
+        0.0
+    };
 
     let swap_used_gb = mem.swap_used_kb() as f64 / 1_048_576.0;
     let swap_total_gb = mem.swap_total_kb as f64 / 1_048_576.0;
-    let swap_pct = if swap_total_gb > 0.0 { (swap_used_gb / swap_total_gb) * 100.0 } else { 0.0 };
+    let swap_pct = if swap_total_gb > 0.0 {
+        (swap_used_gb / swap_total_gb) * 100.0
+    } else {
+        0.0
+    };
 
     out.push_str(&format!(
-        " \x1b[1mRAM Usage:\x1b[0m {:4.1}% {}  {:.2} GB / {:.2} GB (Cached: {:.2} GB)\n",
+        " \x1b[1mRAM Usage:\x1b[0m {:4.1}% {}  {:.2} GB / {:.2} GB (Cached: {:.2} GB)\x1b[K\n",
         ram_pct,
         render_colored_bar(ram_pct, 24),
         used_gb,
         total_gb,
         mem.cached_kb as f64 / 1_048_576.0
     ));
+    rendered_lines += 1;
 
     if swap_total_gb > 0.0 {
         out.push_str(&format!(
-            " \x1b[1mSwap Used:\x1b[0m {:4.1}% {}  {:.2} GB / {:.2} GB\n",
+            " \x1b[1mSwap Used:\x1b[0m {:4.1}% {}  {:.2} GB / {:.2} GB\x1b[K\n",
             swap_pct,
             render_colored_bar(swap_pct, 24),
             swap_used_gb,
             swap_total_gb
         ));
+        rendered_lines += 1;
     }
 
-    out.push_str("\x1b[90m─────────────────────────────────────────────────────────────────────────────────\x1b[0m\n");
+    out.push_str(&div);
+    rendered_lines += 1;
 
-    // 4. Network I/O Bandwidth
-    out.push_str(" \x1b[1mNetwork Traffic:\x1b[0m\n");
-    for (iface, (rx_kbps, tx_kbps, tot_rx, tot_tx)) in net_speeds {
+    // 4. Network Traffic (sorted by activity, max 2-3 interfaces to save space)
+    out.push_str(" \x1b[1mNetwork Traffic:\x1b[0m\x1b[K\n");
+    rendered_lines += 1;
+
+    let mut active_ifaces: Vec<_> = net_speeds.iter().collect();
+    active_ifaces.sort_by(|a, b| {
+        let act_a = (a.1).0 + (a.1).1 + (a.1).2 as f64 + (a.1).3 as f64;
+        let act_b = (b.1).0 + (b.1).1 + (b.1).2 as f64 + (b.1).3 as f64;
+        act_b
+            .partial_cmp(&act_a)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let max_ifaces = if rows >= 35 { 3 } else { 2 };
+    for (iface, (rx_kbps, tx_kbps, tot_rx, tot_tx)) in active_ifaces.iter().take(max_ifaces) {
         out.push_str(&format!(
-            "   \x1b[1;36m{:6}\x1b[0m  ↓ \x1b[1;32m{:7.1} KB/s\x1b[0m ({:6.1} MB total)   ↑ \x1b[1;34m{:7.1} KB/s\x1b[0m ({:6.1} MB total)\n",
+            "   \x1b[1;36m{:6}\x1b[0m  ↓ \x1b[1;32m{:7.1} KB/s\x1b[0m ({:6.1} MB)   ↑ \x1b[1;34m{:7.1} KB/s\x1b[0m ({:6.1} MB)\x1b[K\n",
             iface,
             rx_kbps,
             *tot_rx as f64 / 1_048_576.0,
             tx_kbps,
             *tot_tx as f64 / 1_048_576.0
         ));
+        rendered_lines += 1;
     }
 
-    out.push_str("\x1b[90m─────────────────────────────────────────────────────────────────────────────────\x1b[0m\n");
+    out.push_str(&div);
+    rendered_lines += 1;
 
-    // 5. Top Active Processes Table
-    let sort_label = match monitor.sort_order {
-        SortOrder::Cpu => "\x1b[1;32m[Sorted by CPU%]\x1b[0m",
-        SortOrder::Memory => "\x1b[1;34m[Sorted by MEM]\x1b[0m",
-        SortOrder::Pid => "\x1b[1;33m[Sorted by PID]\x1b[0m",
-    };
+    // 5. Top Active Processes Table (Full coverage down to footer)
+    // 1 line for table header, 1 line for footer
+    let available_proc_rows = rows.saturating_sub(rendered_lines + 2);
 
-    out.push_str(&format!(" \x1b[1mTop Processes:\x1b[0m {} (Showing top 10)\n", sort_label));
-    out.push_str("   \x1b[1mPID     CPU%     MEM (MB)   STATE   COMMAND\x1b[0m\n");
+    // Calculate command column width
+    // Fixed columns: PID (7), CPU% (7), MEM(MB) (10), TIME+ (9), STATE (6) = 39 chars.
+    let cmd_width = cols.saturating_sub(41).max(10);
 
-    for p in processes.iter().take(10) {
-        let mem_mb = p.rss_kb as f64 / 1024.0;
-        let cpu_color = if p.cpu_percent > 50.0 {
-            "\x1b[1;31m"
-        } else if p.cpu_percent > 15.0 {
-            "\x1b[1;33m"
+    let proc_header = format!(
+        "\x1b[7m\x1b[1m {:<6} {:>6} {:>10} {:>9}  {:<5} {:<cmd_width$}\x1b[0m\x1b[K\n",
+        "PID",
+        "CPU%",
+        "MEM (MB)",
+        "TIME+",
+        "STATE",
+        "COMMAND",
+        cmd_width = cmd_width
+    );
+    out.push_str(&proc_header);
+
+    // Adjust scrolling and selection bounds
+    if processes.is_empty() {
+        monitor.selected_index = 0;
+        monitor.scroll_offset = 0;
+    } else {
+        if monitor.selected_index >= processes.len() {
+            monitor.selected_index = processes.len() - 1;
+        }
+        if monitor.selected_index < monitor.scroll_offset {
+            monitor.scroll_offset = monitor.selected_index;
+        } else if monitor.selected_index >= monitor.scroll_offset + available_proc_rows {
+            monitor.scroll_offset = monitor.selected_index + 1 - available_proc_rows;
+        }
+        if monitor.scroll_offset + available_proc_rows > processes.len() {
+            monitor.scroll_offset = processes.len().saturating_sub(available_proc_rows);
+        }
+    }
+
+    for row_idx in 0..available_proc_rows {
+        let abs_idx = monitor.scroll_offset + row_idx;
+        if abs_idx < processes.len() {
+            let p = &processes[abs_idx];
+            let mem_mb = p.rss_kb as f64 / 1024.0;
+            let is_selected = abs_idx == monitor.selected_index;
+            let time_str = format_time_ticks(p.total_time_ticks);
+
+            let comm_display = if p.comm.len() > cmd_width {
+                &p.comm[..cmd_width]
+            } else {
+                &p.comm
+            };
+
+            if is_selected {
+                // Highlight selected process with inverse bar
+                let line =
+                    format!(
+                    "\x1b[7m {:<6} {:>5.1}% {:>10.1} {:>9}  [{}]  {:<cmd_width$}\x1b[0m\x1b[K\n",
+                    p.pid, p.cpu_percent, mem_mb, time_str, p.state, comm_display,
+                    cmd_width = cmd_width
+                );
+                out.push_str(&line);
+            } else {
+                let cpu_color = if p.cpu_percent > 50.0 {
+                    "\x1b[1;31m"
+                } else if p.cpu_percent > 15.0 {
+                    "\x1b[1;33m"
+                } else if p.cpu_percent > 0.0 {
+                    "\x1b[32m"
+                } else {
+                    "\x1b[90m"
+                };
+
+                let state_color = match p.state {
+                    'R' => "\x1b[1;32m",
+                    'D' => "\x1b[1;33m",
+                    'Z' => "\x1b[1;31m",
+                    _ => "\x1b[37m",
+                };
+
+                let line = format!(
+                    " \x1b[36m{:<6}\x1b[0m {}{:>5.1}%\x1b[0m {:>10.1} \x1b[90m{:>9}\x1b[0m  {}[{}]\x1b[0m  {:<cmd_width$}\x1b[K\n",
+                    p.pid, cpu_color, p.cpu_percent, mem_mb, time_str, state_color, p.state, comm_display,
+                    cmd_width = cmd_width
+                );
+                out.push_str(&line);
+            }
         } else {
-            "\x1b[0m"
-        };
-
-        out.push_str(&format!(
-            "   {:<7} {}{:5.1}%\x1b[0m    {:7.1}     [{}]     {:<25}\n",
-            p.pid, cpu_color, p.cpu_percent, mem_mb, p.state, p.comm
-        ));
+            // Fill unused process lines so terminal is completely covered
+            out.push_str("\x1b[K\n");
+        }
     }
 
-    out.push_str("\x1b[90m─────────────────────────────────────────────────────────────────────────────────\x1b[0m\n");
+    // 6. Interactive Hotkey Footer (Pinned to bottom line)
+    out.push_str(" \x1b[7m c \x1b[0m CPU  \x1b[7m m \x1b[0m MEM  \x1b[7m p \x1b[0m PID  \x1b[7m Space \x1b[0m Pause  \x1b[7m +/- \x1b[0m Rate  \x1b[7m ↑↓ \x1b[0m Scroll  \x1b[7m q \x1b[0m Quit\x1b[K");
 
-    // 6. Interactive Hotkey Footer
-    out.push_str(" \x1b[1m[c]\x1b[0m Sort CPU  \x1b[1m[m]\x1b[0m Sort RAM  \x1b[1m[p]\x1b[0m Sort PID  \x1b[1m[Space]\x1b[0m Pause  \x1b[1m[+]/[-]\x1b[0m Rate  \x1b[1m[q]\x1b[0m Quit\n");
+    // Erase any remaining lines below the footer
+    out.push_str("\x1b[J");
 
     // Single flush to terminal
-    print!("{}", out);
-    let _ = io::stdout().flush();
+    let mut stdout = io::stdout();
+    let _ = stdout.write_all(out.as_bytes());
+    let _ = stdout.flush();
 }
 
 fn render_colored_bar(pct: f64, width: usize) -> String {
-    let filled = ((pct / 100.0) * width as f64).round().clamp(0.0, width as f64) as usize;
+    let filled = ((pct / 100.0) * width as f64)
+        .round()
+        .clamp(0.0, width as f64) as usize;
     let empty = width.saturating_sub(filled);
 
     let color = if pct >= 80.0 {
@@ -519,7 +879,12 @@ fn render_colored_bar(pct: f64, width: usize) -> String {
         "\x1b[1;32m" // Green
     };
 
-    format!("[{}{}{}\x1b[0m]", color, "█".repeat(filled), "░".repeat(empty))
+    format!(
+        "[{}{}{}\x1b[0m]",
+        color,
+        "█".repeat(filled),
+        "░".repeat(empty)
+    )
 }
 
 fn render_sparkline(history: &VecDeque<f64>) -> String {
@@ -558,100 +923,171 @@ fn main() {
     };
 
     let mut monitor = SystemMonitor::new();
-    let mut stdin_buffer = [0u8; 16];
+    let mut stdin_buffer = [0u8; 64];
+
+    let mut global_cpu_pct = 0.0;
+    let mut core_pcts = Vec::new();
+    let mut mem = MemInfo::default();
+    let mut net_speeds = HashMap::new();
+    let mut procs = Vec::new();
+
+    let mut next_metric_tick = Instant::now();
+    let mut needs_render = true;
 
     loop {
-        let tick_start = Instant::now();
-        let elapsed_secs = monitor.prev_tick_time.elapsed().as_secs_f64().max(0.001);
-        monitor.prev_tick_time = Instant::now();
+        let now = Instant::now();
 
-        if !monitor.paused {
-            // Read fresh CPU
-            let (curr_global, curr_cores) = monitor.read_cpu_snapshots().unwrap_or_default();
-            let global_cpu_pct = calc_cpu_percent(&monitor.prev_global_cpu, &curr_global);
+        // 1. Tick metrics when time is up
+        if now >= next_metric_tick {
+            let elapsed_secs = monitor.prev_tick_time.elapsed().as_secs_f64().max(0.001);
+            monitor.prev_tick_time = Instant::now();
 
-            let mut core_pcts = Vec::new();
-            for (prev, curr) in monitor.prev_per_core_cpu.iter().zip(curr_cores.iter()) {
-                core_pcts.push(calc_cpu_percent(prev, curr));
-            }
+            if !monitor.paused {
+                // Read fresh CPU
+                let (curr_global, curr_cores) = monitor.read_cpu_snapshots().unwrap_or_default();
+                global_cpu_pct = calc_cpu_percent(&monitor.prev_global_cpu, &curr_global);
 
-            monitor.prev_global_cpu = curr_global;
-            monitor.prev_per_core_cpu = curr_cores;
-
-            // Push to sparkline history
-            if monitor.cpu_history.len() >= 24 {
-                monitor.cpu_history.pop_front();
-            }
-            monitor.cpu_history.push_back(global_cpu_pct);
-
-            // Read Memory
-            let mem = monitor.read_mem_info().unwrap_or_default();
-
-            // Read Network Throughput
-            let curr_net = monitor.read_net_snapshots().unwrap_or_default();
-            let mut net_speeds = HashMap::new();
-
-            for (iface, curr_stat) in &curr_net {
-                if let Some(prev_stat) = monitor.prev_net_devices.get(iface) {
-                    let rx_diff = curr_stat.rx_bytes.saturating_sub(prev_stat.rx_bytes) as f64;
-                    let tx_diff = curr_stat.tx_bytes.saturating_sub(prev_stat.tx_bytes) as f64;
-
-                    let rx_kbps = (rx_diff / 1024.0) / elapsed_secs;
-                    let tx_kbps = (tx_diff / 1024.0) / elapsed_secs;
-
-                    net_speeds.insert(
-                        iface.clone(),
-                        (rx_kbps, tx_kbps, curr_stat.rx_bytes, curr_stat.tx_bytes),
-                    );
+                core_pcts.clear();
+                for (prev, curr) in monitor.prev_per_core_cpu.iter().zip(curr_cores.iter()) {
+                    core_pcts.push(calc_cpu_percent(prev, curr));
                 }
+
+                monitor.prev_global_cpu = curr_global;
+                monitor.prev_per_core_cpu = curr_cores;
+
+                // Push to sparkline history
+                if monitor.cpu_history.len() >= 24 {
+                    monitor.cpu_history.pop_front();
+                }
+                monitor.cpu_history.push_back(global_cpu_pct);
+
+                // Read Memory
+                mem = monitor.read_mem_info().unwrap_or_default();
+
+                // Read Network Throughput
+                let curr_net = monitor.read_net_snapshots().unwrap_or_default();
+                net_speeds.clear();
+                for (iface, curr_stat) in &curr_net {
+                    if let Some(prev_stat) = monitor.prev_net_devices.get(iface) {
+                        let rx_diff = curr_stat.rx_bytes.saturating_sub(prev_stat.rx_bytes) as f64;
+                        let tx_diff = curr_stat.tx_bytes.saturating_sub(prev_stat.tx_bytes) as f64;
+                        let rx_kbps = (rx_diff / 1024.0) / elapsed_secs;
+                        let tx_kbps = (tx_diff / 1024.0) / elapsed_secs;
+                        net_speeds.insert(
+                            iface.clone(),
+                            (rx_kbps, tx_kbps, curr_stat.rx_bytes, curr_stat.tx_bytes),
+                        );
+                    }
+                }
+                monitor.prev_net_devices = curr_net;
+
+                // Read Processes
+                procs = monitor.read_processes(elapsed_secs);
             }
-            monitor.prev_net_devices = curr_net;
 
-            // Read Processes
-            let procs = monitor.read_processes(elapsed_secs);
-
-            // Render Dashboard Frame
-            render_dashboard(&mut monitor, global_cpu_pct, &core_pcts, &mem, &net_speeds, &procs);
+            needs_render = true;
+            next_metric_tick = now + Duration::from_millis(monitor.refresh_rate_ms);
         }
 
-        // Handle Non-blocking Keyboard Input
-        let mut stdin = io::stdin();
-        if let Ok(n) = stdin.read(&mut stdin_buffer) {
-            for &byte in &stdin_buffer[..n] {
-                match byte {
-                    b'q' | b'Q' | 27 => {
-                        // 'q' or ESC -> Exit cleanly
-                        return;
-                    }
-                    b' ' => {
-                        // Spacebar -> Toggle Pause
+        // 2. Render frame if needed
+        if needs_render {
+            let (cols, rows) = get_terminal_size();
+            render_dashboard(
+                &mut monitor,
+                cols,
+                rows,
+                global_cpu_pct,
+                &core_pcts,
+                &mem,
+                &net_speeds,
+                &procs,
+            );
+            needs_render = false;
+        }
+
+        // 3. Poll stdin for user interaction until next metric tick
+        let now = Instant::now();
+        let timeout_ms = if next_metric_tick > now {
+            (next_metric_tick - now).as_millis().min(1000) as i32
+        } else {
+            0
+        };
+
+        if poll_stdin(timeout_ms) {
+            let mut n = read_stdin_bytes(&mut stdin_buffer);
+            if n == 1 && stdin_buffer[0] == 27 {
+                // Check if following escape sequence arrives
+                if poll_stdin(25) {
+                    let m = read_stdin_bytes(&mut stdin_buffer[1..]);
+                    n += m;
+                }
+            }
+
+            let actions = parse_keys(&stdin_buffer[..n]);
+            for action in actions {
+                match action {
+                    KeyAction::Quit => return,
+                    KeyAction::TogglePause => {
                         monitor.paused = !monitor.paused;
+                        needs_render = true;
                     }
-                    b'c' | b'C' => {
-                        monitor.sort_order = SortOrder::Cpu;
+                    KeyAction::Sort(order) => {
+                        monitor.sort_order = order;
+                        monitor.sort_processes(&mut procs);
+                        monitor.selected_index = 0;
+                        monitor.scroll_offset = 0;
+                        needs_render = true;
                     }
-                    b'm' | b'M' => {
-                        monitor.sort_order = SortOrder::Memory;
+                    KeyAction::AdjustRate(delta) => {
+                        if delta < 0 {
+                            monitor.refresh_rate_ms = monitor
+                                .refresh_rate_ms
+                                .saturating_sub((-delta) as u64)
+                                .max(250);
+                        } else {
+                            monitor.refresh_rate_ms =
+                                (monitor.refresh_rate_ms + delta as u64).min(5000);
+                        }
+                        needs_render = true;
                     }
-                    b'p' | b'P' => {
-                        monitor.sort_order = SortOrder::Pid;
+                    KeyAction::Up => {
+                        monitor.selected_index = monitor.selected_index.saturating_sub(1);
+                        needs_render = true;
                     }
-                    b'+' | b'=' => {
-                        monitor.refresh_rate_ms = monitor.refresh_rate_ms.saturating_sub(250).max(250);
+                    KeyAction::Down => {
+                        if !procs.is_empty() {
+                            monitor.selected_index =
+                                (monitor.selected_index + 1).min(procs.len() - 1);
+                        }
+                        needs_render = true;
                     }
-                    b'-' | b'_' => {
-                        monitor.refresh_rate_ms = (monitor.refresh_rate_ms + 250).min(5000);
+                    KeyAction::PageUp => {
+                        let (_, rows) = get_terminal_size();
+                        let page = rows.saturating_sub(15).max(5);
+                        monitor.selected_index = monitor.selected_index.saturating_sub(page);
+                        needs_render = true;
                     }
-                    _ => {}
+                    KeyAction::PageDown => {
+                        let (_, rows) = get_terminal_size();
+                        let page = rows.saturating_sub(15).max(5);
+                        if !procs.is_empty() {
+                            monitor.selected_index =
+                                (monitor.selected_index + page).min(procs.len() - 1);
+                        }
+                        needs_render = true;
+                    }
+                    KeyAction::Home => {
+                        monitor.selected_index = 0;
+                        needs_render = true;
+                    }
+                    KeyAction::End => {
+                        if !procs.is_empty() {
+                            monitor.selected_index = procs.len() - 1;
+                        }
+                        needs_render = true;
+                    }
                 }
             }
-        }
-
-        // Sleep remainder of tick
-        let tick_duration = Duration::from_millis(monitor.refresh_rate_ms);
-        let elapsed = tick_start.elapsed();
-        if elapsed < tick_duration {
-            thread::sleep(tick_duration - elapsed);
         }
     }
 }
